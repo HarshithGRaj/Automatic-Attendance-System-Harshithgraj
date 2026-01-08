@@ -1,0 +1,1189 @@
+"""
+FIXED BIOMETRIC ATTENDANCE SYSTEM - CAMERA ISSUES RESOLVED
+This version includes enhanced camera handling and error detection
+"""
+
+import cv2
+import face_recognition
+import numpy as np
+import sqlite3
+from datetime import datetime, timedelta
+import os
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from PIL import Image, ImageTk
+import threading
+import pandas as pd
+
+class BiometricAttendanceSystem:
+    def __init__(self, db_path="biometric_attendance.db"):
+        self.db_path = db_path
+        self.known_faces = []
+        self.known_employees = []
+        self.camera_running = False
+        self.current_camera_index = 0
+        self.available_cameras = []
+        self.init_database()
+        self.detect_cameras()
+        self.load_registered_employees()
+        
+    def init_database(self):
+        """Initialize SQLite database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS employees (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                employee_id TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                department TEXT,
+                email TEXT,
+                phone TEXT,
+                face_encoding BLOB NOT NULL,
+                registration_photo BLOB NOT NULL,
+                registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'Active'
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS attendance_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                employee_id TEXT NOT NULL,
+                log_type TEXT NOT NULL,
+                log_date DATE NOT NULL,
+                log_time TIME NOT NULL,
+                captured_image BLOB NOT NULL,
+                confidence REAL,
+                camera_id INTEGER,
+                class_name TEXT,
+                teacher_name TEXT,
+                subject TEXT,
+                capture_mode TEXT DEFAULT 'AUTO',
+                FOREIGN KEY (employee_id) REFERENCES employees(employee_id)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS attendance_summary (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                employee_id TEXT NOT NULL,
+                date DATE NOT NULL,
+                check_in_time TIME,
+                check_out_time TIME,
+                total_hours REAL,
+                status TEXT DEFAULT 'Present',
+                class_name TEXT,
+                teacher_name TEXT,
+                subject TEXT,
+                FOREIGN KEY (employee_id) REFERENCES employees(employee_id),
+                UNIQUE(employee_id, date, class_name, subject)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        print("✓ Database initialized")
+    
+    def detect_cameras(self):
+        """Detect all available cameras with enhanced detection"""
+        print("\nDetecting cameras...")
+        self.available_cameras = []
+        
+        # Try multiple camera backends
+        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+        
+        for i in range(3):  # Check first 3 camera indices
+            for backend in backends:
+                try:
+                    cap = cv2.VideoCapture(i, backend)
+                    if cap.isOpened():
+                        ret, frame = cap.read()
+                        if ret and frame is not None:
+                            if i not in self.available_cameras:
+                                self.available_cameras.append(i)
+                                print(f"  ✓ Camera {i} detected (Backend: {backend})")
+                            cap.release()
+                            break
+                    cap.release()
+                except:
+                    pass
+        
+        if not self.available_cameras:
+            print("  ⚠ No cameras detected, defaulting to camera 0")
+            self.available_cameras = [0]
+        
+        print(f"  Available cameras: {self.available_cameras}\n")
+    
+    def open_camera(self, camera_index):
+        """Open camera with proper error handling"""
+        # Try different backends in order of preference
+        backends = [
+            (cv2.CAP_DSHOW, "DirectShow"),
+            (cv2.CAP_MSMF, "Media Foundation"),
+            (cv2.CAP_ANY, "Auto")
+        ]
+        
+        for backend, name in backends:
+            try:
+                cap = cv2.VideoCapture(camera_index, backend)
+                if cap.isOpened():
+                    # Set optimal parameters
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    cap.set(cv2.CAP_PROP_FPS, 30)
+                    
+                    # Test read
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        print(f"  ✓ Camera opened with {name} backend")
+                        return cap
+                    else:
+                        cap.release()
+                        
+            except Exception as e:
+                print(f"  ✗ Failed with {name}: {e}")
+                continue
+        
+        return None
+    
+    def image_to_blob(self, image):
+        """Convert image to binary blob"""
+        _, buffer = cv2.imencode('.jpg', image)
+        return buffer.tobytes()
+    
+    def blob_to_image(self, blob):
+        """Convert binary blob to image"""
+        nparr = np.frombuffer(blob, np.uint8)
+        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    
+    def load_registered_employees(self):
+        """Load all registered employees"""
+        self.known_faces = []
+        self.known_employees = []
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT employee_id, name, department, email, face_encoding 
+            FROM employees WHERE status = 'Active'
+        ''')
+        employees = cursor.fetchall()
+        conn.close()
+        
+        for emp_id, name, dept, email, encoding_blob in employees:
+            encoding = np.frombuffer(encoding_blob, dtype=np.float64)
+            self.known_faces.append(encoding)
+            self.known_employees.append({
+                'id': emp_id,
+                'name': name,
+                'department': dept,
+                'email': email
+            })
+        
+        print(f"✓ Loaded {len(self.known_faces)} registered employees")
+    
+    def mark_attendance(self, employee_id, employee_name, captured_image, confidence, 
+                       camera_id=0, class_name=None, teacher_name=None, subject=None, 
+                       capture_mode='AUTO'):
+        """Mark attendance with captured image"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            current_date = datetime.now().date()
+            current_time = datetime.now().time()
+            image_blob = self.image_to_blob(captured_image)
+            
+            if class_name and subject:
+                cursor.execute('''
+                    SELECT check_in_time, check_out_time FROM attendance_summary 
+                    WHERE employee_id = ? AND date = ? AND class_name = ? AND subject = ?
+                ''', (employee_id, current_date, class_name, subject))
+            else:
+                cursor.execute('''
+                    SELECT check_in_time, check_out_time FROM attendance_summary 
+                    WHERE employee_id = ? AND date = ?
+                ''', (employee_id, current_date))
+            
+            result = cursor.fetchone()
+            
+            if result is None:
+                log_type = "CHECK_IN"
+                cursor.execute('''
+                    INSERT INTO attendance_summary (employee_id, date, check_in_time, status,
+                                                   class_name, teacher_name, subject)
+                    VALUES (?, ?, ?, 'Present', ?, ?, ?)
+                ''', (employee_id, current_date, current_time, class_name, teacher_name, subject))
+                message = f"Check-In: {employee_name}"
+                if class_name:
+                    message += f" - {class_name} ({subject})"
+                
+            elif result[1] is None:
+                log_type = "CHECK_OUT"
+                check_in = datetime.strptime(str(result[0]), '%H:%M:%S.%f')
+                check_out = datetime.strptime(str(current_time), '%H:%M:%S.%f')
+                hours = (check_out - check_in).total_seconds() / 3600
+                
+                if class_name and subject:
+                    cursor.execute('''
+                        UPDATE attendance_summary 
+                        SET check_out_time = ?, total_hours = ?
+                        WHERE employee_id = ? AND date = ? AND class_name = ? AND subject = ?
+                    ''', (current_time, hours, employee_id, current_date, class_name, subject))
+                else:
+                    cursor.execute('''
+                        UPDATE attendance_summary 
+                        SET check_out_time = ?, total_hours = ?
+                        WHERE employee_id = ? AND date = ?
+                    ''', (current_time, hours, employee_id, current_date))
+                
+                message = f"Check-Out: {employee_name} ({hours:.2f}h)"
+                
+            else:
+                conn.close()
+                return False, "Already checked out"
+            
+            cursor.execute('''
+                INSERT INTO attendance_logs 
+                (employee_id, log_type, log_date, log_time, captured_image, confidence, 
+                 camera_id, class_name, teacher_name, subject, capture_mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (employee_id, log_type, current_date, current_time, image_blob, 
+                  confidence, camera_id, class_name, teacher_name, subject, capture_mode))
+            
+            conn.commit()
+            conn.close()
+            
+            return True, message
+            
+        except Exception as e:
+            return False, str(e)
+    
+    def export_to_excel(self, start_date, end_date, filename, class_name=None, subject=None):
+        """Export attendance to Excel"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            
+            if class_name and subject:
+                query = '''
+                    SELECT e.employee_id, e.name, e.department,
+                           a.date, a.check_in_time, a.check_out_time, 
+                           a.total_hours, a.status, a.class_name, 
+                           a.teacher_name, a.subject
+                    FROM attendance_summary a
+                    JOIN employees e ON a.employee_id = e.employee_id
+                    WHERE a.date BETWEEN ? AND ? AND a.class_name = ? AND a.subject = ?
+                    ORDER BY e.name
+                '''
+                df = pd.read_sql_query(query, conn, params=(start_date, end_date, class_name, subject))
+            else:
+                query = '''
+                    SELECT e.employee_id, e.name, e.department,
+                           a.date, a.check_in_time, a.check_out_time, 
+                           a.total_hours, a.status, a.class_name, 
+                           a.teacher_name, a.subject
+                    FROM attendance_summary a
+                    JOIN employees e ON a.employee_id = e.employee_id
+                    WHERE a.date BETWEEN ? AND ?
+                    ORDER BY a.date DESC, e.employee_id
+                '''
+                df = pd.read_sql_query(query, conn, params=(start_date, end_date))
+            
+            conn.close()
+            
+            df.columns = ['Employee ID', 'Name', 'Department', 'Date', 
+                         'Check In', 'Check Out', 'Hours', 'Status',
+                         'Class', 'Teacher', 'Subject']
+            
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                if class_name and subject:
+                    summary_data = {
+                        'Class Details': ['Class Name', 'Subject', 'Date Range', 'Total Present'],
+                        'Information': [class_name, subject, f"{start_date} to {end_date}", len(df)]
+                    }
+                    summary_df = pd.DataFrame(summary_data)
+                    summary_df.to_excel(writer, sheet_name='Summary', index=False)
+                
+                df.to_excel(writer, index=False, sheet_name='Attendance')
+                
+                workbook = writer.book
+                for sheet_name in writer.sheets:
+                    worksheet = writer.sheets[sheet_name]
+                    
+                    for cell in worksheet[1]:
+                        cell.font = cell.font.copy(bold=True)
+                    
+                    for column in worksheet.columns:
+                        max_length = 0
+                        column = [cell for cell in column]
+                        for cell in column:
+                            try:
+                                if len(str(cell.value)) > max_length:
+                                    max_length = len(cell.value)
+                            except:
+                                pass
+                        adjusted_width = min(max_length + 2, 50)
+                        worksheet.column_dimensions[column[0].column_letter].width = adjusted_width
+            
+            return True, f"Excel exported: {filename}"
+            
+        except Exception as e:
+            return False, str(e)
+
+
+class AdminDashboard:
+    def __init__(self, system):
+        self.system = system
+        self.root = tk.Tk()
+        self.root.title("Biometric Attendance System - Admin Dashboard")
+        self.root.geometry("1200x800")
+        self.root.configure(bg='#f0f0f0')
+        
+        self.camera_label = None
+        self.camera_thread = None
+        self.current_session = {'class': '', 'teacher': '', 'subject': ''}
+        
+        self.setup_ui()
+        
+    def setup_ui(self):
+        """Setup the user interface"""
+        title_frame = tk.Frame(self.root, bg='#2c3e50', height=80)
+        title_frame.pack(fill=tk.X)
+        title_frame.pack_propagate(False)
+        
+        title_label = tk.Label(title_frame, text="🔐 BIOMETRIC ATTENDANCE SYSTEM", 
+                              font=('Arial', 24, 'bold'), bg='#2c3e50', fg='white')
+        title_label.pack(pady=20)
+        
+        main_container = tk.Frame(self.root, bg='#f0f0f0')
+        main_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        left_panel = tk.Frame(main_container, bg='white', relief=tk.RIDGE, bd=2)
+        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, padx=(0, 10), pady=0)
+        
+        button_config = {
+            'font': ('Arial', 11, 'bold'),
+            'width': 25,
+            'height': 2,
+            'cursor': 'hand2'
+        }
+        
+        tk.Label(left_panel, text="QUICK ACTIONS", font=('Arial', 14, 'bold'), 
+                bg='white', fg='#2c3e50').pack(pady=15)
+        
+        buttons = [
+            ("👤 Register Employee", self.open_registration, '#3498db'),
+            ("📹 Start Scanner", self.start_scanner, '#27ae60'),
+            ("🧪 Test Camera", self.test_camera, '#16a085'),
+            ("📊 View Reports", self.view_reports, '#e67e22'),
+            ("📤 Export to Excel", self.export_menu, '#9b59b6'),
+            ("👥 Employee List", self.employee_list, '#f39c12'),
+            ("❌ Exit", self.root.quit, '#95a5a6')
+        ]
+        
+        for text, command, color in buttons:
+            btn = tk.Button(left_panel, text=text, command=command, 
+                          bg=color, fg='white', **button_config)
+            btn.pack(pady=5, padx=15)
+        
+        right_panel = tk.Frame(main_container, bg='white', relief=tk.RIDGE, bd=2)
+        right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        
+        stats_frame = tk.Frame(right_panel, bg='white')
+        stats_frame.pack(fill=tk.X, padx=20, pady=20)
+        
+        tk.Label(stats_frame, text="TODAY'S STATISTICS", 
+                font=('Arial', 16, 'bold'), bg='white', fg='#2c3e50').pack()
+        
+        stats_container = tk.Frame(stats_frame, bg='white')
+        stats_container.pack(pady=15)
+        
+        self.stats_labels = {}
+        stats = [
+            ('Total Employees', 'total_emp', '#3498db'),
+            ('Present Today', 'present', '#27ae60'),
+            ('Absent Today', 'absent', '#e74c3c')
+        ]
+        
+        for i, (label, key, color) in enumerate(stats):
+            frame = tk.Frame(stats_container, bg=color, relief=tk.RAISED, bd=3)
+            frame.grid(row=0, column=i, padx=10)
+            
+            tk.Label(frame, text=label, font=('Arial', 10), 
+                    bg=color, fg='white').pack(pady=5, padx=15)
+            self.stats_labels[key] = tk.Label(frame, text="0", 
+                                             font=('Arial', 24, 'bold'), 
+                                             bg=color, fg='white')
+            self.stats_labels[key].pack(pady=5, padx=15)
+        
+        self.display_frame = tk.Frame(right_panel, bg='#ecf0f1', relief=tk.SUNKEN, bd=2)
+        self.display_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
+        
+        self.display_label = tk.Label(self.display_frame, 
+                                      text="📊 Dashboard Ready\n\nSelect an action from the menu\n\n💡 TIP: Click 'Test Camera' first!",
+                                      font=('Arial', 16), bg='#ecf0f1', fg='#7f8c8d')
+        self.display_label.pack(expand=True)
+        
+        self.update_statistics()
+    
+    def update_statistics(self):
+        """Update dashboard statistics"""
+        try:
+            conn = sqlite3.connect(self.system.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT COUNT(*) FROM employees WHERE status='Active'")
+            total = cursor.fetchone()[0]
+            
+            today = datetime.now().date()
+            cursor.execute("SELECT COUNT(DISTINCT employee_id) FROM attendance_summary WHERE date=?", (today,))
+            present = cursor.fetchone()[0]
+            
+            absent = total - present
+            
+            conn.close()
+            
+            self.stats_labels['total_emp'].config(text=str(total))
+            self.stats_labels['present'].config(text=str(present))
+            self.stats_labels['absent'].config(text=str(absent))
+            
+        except Exception as e:
+            print(f"Error updating stats: {e}")
+    
+    def test_camera(self):
+        """Test camera functionality"""
+        test_window = tk.Toplevel(self.root)
+        test_window.title("Camera Test")
+        test_window.geometry("700x550")
+        test_window.configure(bg='white')
+        
+        tk.Label(test_window, text="🎥 CAMERA TEST", 
+                font=('Arial', 18, 'bold'), bg='white').pack(pady=15)
+        
+        camera_frame = tk.Frame(test_window, bg='black', relief=tk.SUNKEN, bd=3)
+        camera_frame.pack(padx=20, pady=10)
+        
+        camera_label = tk.Label(camera_frame, bg='black')
+        camera_label.pack()
+        
+        status_label = tk.Label(test_window, text="Initializing camera...", 
+                               font=('Arial', 12), bg='white', fg='#3498db')
+        status_label.pack(pady=10)
+        
+        running = {'value': True}
+        
+        def camera_test_loop():
+            cap = self.system.open_camera(self.system.current_camera_index)
+            
+            if cap is None:
+                status_label.config(text="❌ Camera failed to open!", fg='red')
+                messagebox.showerror("Camera Error", 
+                                   "Cannot open camera!\n\n" +
+                                   "Possible fixes:\n" +
+                                   "1. Close other apps using camera\n" +
+                                   "2. Check camera permissions\n" +
+                                   "3. Try different camera index\n" +
+                                   "4. Restart application")
+                return
+            
+            status_label.config(text="✓ Camera working! Press 'Close' to stop", fg='green')
+            frame_count = 0
+            
+            while running['value']:
+                ret, frame = cap.read()
+                if not ret:
+                    status_label.config(text="❌ Cannot read frame", fg='red')
+                    break
+                
+                frame_count += 1
+                cv2.putText(frame, f"Frame: {frame_count}", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame, "Camera OK!", (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img_pil = Image.fromarray(img_rgb)
+                img_pil = img_pil.resize((640, 480))
+                img_tk = ImageTk.PhotoImage(img_pil)
+                camera_label.config(image=img_tk)
+                camera_label.image = img_tk
+            
+            cap.release()
+        
+        def close_test():
+            running['value'] = False
+            test_window.destroy()
+        
+        test_window.protocol("WM_DELETE_WINDOW", close_test)
+        
+        tk.Button(test_window, text="Close", command=close_test,
+                 bg='#e74c3c', fg='white', font=('Arial', 12, 'bold'),
+                 width=15, height=2).pack(pady=10)
+        
+        thread = threading.Thread(target=camera_test_loop, daemon=True)
+        thread.start()
+    
+    def open_registration(self):
+        """Open employee registration window"""
+        reg_window = tk.Toplevel(self.root)
+        reg_window.title("Register New Employee")
+        reg_window.geometry("500x650")
+        reg_window.configure(bg='white')
+        
+        tk.Label(reg_window, text="Employee Registration", 
+                font=('Arial', 18, 'bold'), bg='white').pack(pady=20)
+        
+        fields_frame = tk.Frame(reg_window, bg='white')
+        fields_frame.pack(pady=20, padx=40, fill=tk.BOTH)
+        
+        fields = [
+            ('Employee ID:', 'emp_id'),
+            ('Full Name:', 'name'),
+            ('Department:', 'dept'),
+            ('Email:', 'email'),
+            ('Phone:', 'phone')
+        ]
+        
+        entries = {}
+        for label_text, key in fields:
+            frame = tk.Frame(fields_frame, bg='white')
+            frame.pack(fill=tk.X, pady=8)
+            tk.Label(frame, text=label_text, font=('Arial', 11), 
+                    bg='white', width=15, anchor='w').pack(side=tk.LEFT)
+            entry = tk.Entry(frame, font=('Arial', 11), width=30)
+            entry.pack(side=tk.LEFT, expand=True, fill=tk.X)
+            entries[key] = entry
+        
+        photo_label = tk.Label(reg_window, text="No photo captured", 
+                              bg='#ecf0f1', width=40, height=10)
+        photo_label.pack(pady=10)
+        
+        captured_image = {'img': None}
+        
+        def capture_photo():
+            cap = self.system.open_camera(self.system.current_camera_index)
+            
+            if cap is None:
+                messagebox.showerror("Error", "Cannot open camera!")
+                return
+            
+            messagebox.showinfo("Photo Capture", "Press SPACE to capture, ESC to cancel")
+            
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    messagebox.showerror("Error", "Cannot read from camera")
+                    break
+                
+                cv2.putText(frame, "Press SPACE to capture", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.imshow('Capture Photo - Press SPACE', frame)
+                
+                key = cv2.waitKey(1) & 0xFF
+                if key == 32:  # SPACE
+                    captured_image['img'] = frame.copy()
+                    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    img_pil = Image.fromarray(img_rgb)
+                    img_pil = img_pil.resize((300, 225))
+                    img_tk = ImageTk.PhotoImage(img_pil)
+                    photo_label.config(image=img_tk, text='')
+                    photo_label.image = img_tk
+                    break
+                elif key == 27:  # ESC
+                    break
+            
+            cap.release()
+            cv2.destroyAllWindows()
+        
+        def save_employee():
+            if captured_image['img'] is None:
+                messagebox.showerror("Error", "Please capture photo first")
+                return
+            
+            rgb_image = cv2.cvtColor(captured_image['img'], cv2.COLOR_BGR2RGB)
+            face_encodings = face_recognition.face_encodings(rgb_image)
+            
+            if len(face_encodings) == 0:
+                messagebox.showerror("Error", "No face detected in photo")
+                return
+            
+            try:
+                conn = sqlite3.connect(self.system.db_path)
+                cursor = conn.cursor()
+                
+                encoding_blob = face_encodings[0].tobytes()
+                image_blob = self.system.image_to_blob(captured_image['img'])
+                
+                cursor.execute('''
+                    INSERT INTO employees (employee_id, name, department, email, phone,
+                                         face_encoding, registration_photo)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (entries['emp_id'].get(), entries['name'].get(), entries['dept'].get(),
+                      entries['email'].get(), entries['phone'].get(), encoding_blob, image_blob))
+                
+                conn.commit()
+                conn.close()
+                
+                self.system.load_registered_employees()
+                self.update_statistics()
+                messagebox.showinfo("Success", f"Employee {entries['name'].get()} registered!")
+                reg_window.destroy()
+                
+            except sqlite3.IntegrityError:
+                messagebox.showerror("Error", "Employee ID already exists")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+        
+        btn_frame = tk.Frame(reg_window, bg='white')
+        btn_frame.pack(pady=20)
+        
+        tk.Button(btn_frame, text="📷 Capture Photo", command=capture_photo,
+                 bg='#3498db', fg='white', font=('Arial', 11, 'bold'),
+                 width=15, height=2).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(btn_frame, text="💾 Save Employee", command=save_employee,
+                 bg='#27ae60', fg='white', font=('Arial', 11, 'bold'),
+                 width=15, height=2).pack(side=tk.LEFT, padx=5)
+    
+    def start_scanner(self):
+        """Start attendance scanner"""
+        if self.system.camera_running:
+            messagebox.showwarning("Warning", "Scanner already running")
+            return
+        
+        # Session details window
+        session_window = tk.Toplevel(self.root)
+        session_window.title("Session Details")
+        session_window.geometry("400x350")
+        session_window.configure(bg='white')
+        session_window.grab_set()
+        
+        tk.Label(session_window, text="📚 Enter Session Details", 
+                font=('Arial', 16, 'bold'), bg='white').pack(pady=20)
+        
+        fields_frame = tk.Frame(session_window, bg='white')
+        fields_frame.pack(pady=20, padx=40)
+        
+        tk.Label(fields_frame, text="Class Name:", font=('Arial', 11), bg='white').grid(row=0, column=0, pady=10, sticky='w')
+        class_entry = tk.Entry(fields_frame, font=('Arial', 11), width=25)
+        class_entry.grid(row=0, column=1, pady=10, padx=10)
+        
+        tk.Label(fields_frame, text="Teacher Name:", font=('Arial', 11), bg='white').grid(row=1, column=0, pady=10, sticky='w')
+        teacher_entry = tk.Entry(fields_frame, font=('Arial', 11), width=25)
+        teacher_entry.grid(row=1, column=1, pady=10, padx=10)
+        
+        tk.Label(fields_frame, text="Subject:", font=('Arial', 11), bg='white').grid(row=2, column=0, pady=10, sticky='w')
+        subject_entry = tk.Entry(fields_frame, font=('Arial', 11), width=25)
+        subject_entry.grid(row=2, column=1, pady=10, padx=10)
+        
+        def start_with_details():
+            class_name = class_entry.get().strip()
+            teacher_name = teacher_entry.get().strip()
+            subject = subject_entry.get().strip()
+            
+            if not class_name or not teacher_name or not subject:
+                messagebox.showerror("Error", "All fields are required!")
+                return
+            
+            self.current_session = {
+                'class': class_name,
+                'teacher': teacher_name,
+                'subject': subject
+            }
+            
+            session_window.destroy()
+            self.open_scanner_window()
+        
+        tk.Button(session_window, text="▶ Start Scanner", command=start_with_details,
+                 bg='#27ae60', fg='white', font=('Arial', 12, 'bold'),
+                 width=20, height=2).pack(pady=30)
+    
+    def open_scanner_window(self):
+        """Open scanner window with manual capture"""
+        scanner_window = tk.Toplevel(self.root)
+        scanner_window.title("Attendance Scanner")
+        scanner_window.geometry("1000x750")
+        scanner_window.configure(bg='#2c3e50')
+        
+        # Session info
+        session_info_frame = tk.Frame(scanner_window, bg='#34495e', relief=tk.RIDGE, bd=2)
+        session_info_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        info_text = f"📚 Class: {self.current_session['class']}  |  👨‍🏫 Teacher: {self.current_session['teacher']}  |  📖 Subject: {self.current_session['subject']}"
+        tk.Label(session_info_frame, text=info_text, 
+                font=('Arial', 12, 'bold'), bg='#34495e', fg='white').pack(pady=10)
+        
+        tk.Label(scanner_window, text="🎥 LIVE ATTENDANCE SCANNER", 
+                font=('Arial', 20, 'bold'), bg='#2c3e50', fg='white').pack(pady=10)
+        
+        camera_frame = tk.Frame(scanner_window, bg='black', relief=tk.SUNKEN, bd=3)
+        camera_frame.pack(padx=20, pady=10)
+        
+        self.camera_label = tk.Label(camera_frame, bg='black', width=900, height=600)
+        self.camera_label.pack()
+        
+        # Control buttons
+        control_frame = tk.Frame(scanner_window, bg='#2c3e50')
+        control_frame.pack(pady=10)
+        
+        self.capture_btn = tk.Button(control_frame, text="📸 CAPTURE ATTENDANCE", 
+                                     command=lambda: None,  # Will be set in scanner loop
+                                     bg='#e67e22', fg='white', font=('Arial', 14, 'bold'),
+                                     width=25, height=2, cursor='hand2')
+        self.capture_btn.pack(side=tk.LEFT, padx=10)
+        
+        self.auto_mode_var = tk.BooleanVar(value=True)
+        auto_check = tk.Checkbutton(control_frame, text="Auto Mode", 
+                                    variable=self.auto_mode_var,
+                                    font=('Arial', 12, 'bold'), bg='#2c3e50', 
+                                    fg='white', selectcolor='#34495e',
+                                    activebackground='#2c3e50', activeforeground='white')
+        auto_check.pack(side=tk.LEFT, padx=10)
+        
+        log_frame = tk.Frame(scanner_window, bg='white', relief=tk.RIDGE, bd=2)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        tk.Label(log_frame, text="Attendance Log", font=('Arial', 12, 'bold'),
+                bg='white').pack(pady=5)
+        
+        log_text = tk.Text(log_frame, height=8, font=('Courier', 10))
+        log_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        self.system.camera_running = True
+        self.detected_faces = []
+        
+        def manual_capture_attendance():
+            """Capture attendance manually"""
+            if not self.detected_faces:
+                messagebox.showwarning("No Faces", "No faces detected!")
+                return
+            
+            captured_count = 0
+            for face_data in self.detected_faces:
+                employee = face_data['employee']
+                confidence = face_data['confidence']
+                face_img = face_data['image']
+                
+                success, message = self.system.mark_attendance(
+                    employee['id'], employee['name'], face_img, confidence,
+                    self.system.current_camera_index,
+                    self.current_session['class'],
+                    self.current_session['teacher'],
+                    self.current_session['subject'],
+                    'MANUAL'
+                )
+                
+                if success:
+                    captured_count += 1
+                    log_msg = f"[{datetime.now().strftime('%H:%M:%S')}] MANUAL - {message}\n"
+                    log_text.insert('1.0', log_msg)
+                    log_text.see('1.0')
+            
+            if captured_count > 0:
+                messagebox.showinfo("Success", f"Captured {captured_count} attendance record(s)")
+                self.detected_faces = []
+        
+        self.capture_btn.config(command=manual_capture_attendance)
+        
+        def scanner_loop():
+            cap = self.system.open_camera(self.system.current_camera_index)
+            
+            if cap is None:
+                messagebox.showerror("Camera Error", 
+                                   "Cannot open camera!\n\nPlease:\n" +
+                                   "1. Close other apps using camera\n" +
+                                   "2. Test camera first\n" +
+                                   "3. Check camera permissions")
+                self.system.camera_running = False
+                scanner_window.destroy()
+                return
+            
+            process_count = 0
+            last_auto_capture = {}
+            
+            while self.system.camera_running:
+                ret, frame = cap.read()
+                if not ret:
+                    log_text.insert('1.0', f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: Cannot read frame\n")
+                    break
+                
+                process_count += 1
+                
+                if process_count % 3 == 0:  # Process every 3rd frame
+                    small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+                    rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+                    
+                    face_locations = face_recognition.face_locations(rgb_small)
+                    face_encodings = face_recognition.face_encodings(rgb_small, face_locations)
+                    
+                    self.detected_faces = []
+                    
+                    for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+                        top *= 4
+                        right *= 4
+                        bottom *= 4
+                        left *= 4
+                        
+                        matches = face_recognition.compare_faces(self.system.known_faces, face_encoding, tolerance=0.5)
+                        name = "Unknown"
+                        color = (0, 0, 255)
+                        
+                        if True in matches:
+                            face_distances = face_recognition.face_distance(self.system.known_faces, face_encoding)
+                            best_match = np.argmin(face_distances)
+                            
+                            if matches[best_match]:
+                                employee = self.system.known_employees[best_match]
+                                name = employee['name']
+                                emp_id = employee['id']
+                                confidence = (1 - face_distances[best_match]) * 100
+                                
+                                face_img = frame[max(0, top-20):bottom+20, max(0, left-20):right+20]
+                                
+                                self.detected_faces.append({
+                                    'employee': employee,
+                                    'confidence': confidence,
+                                    'image': face_img
+                                })
+                                
+                                # Auto mode
+                                if self.auto_mode_var.get():
+                                    current_time = datetime.now()
+                                    if emp_id not in last_auto_capture or \
+                                       (current_time - last_auto_capture[emp_id]).seconds > 5:
+                                        
+                                        success, message = self.system.mark_attendance(
+                                            emp_id, name, face_img, confidence,
+                                            self.system.current_camera_index,
+                                            self.current_session['class'],
+                                            self.current_session['teacher'],
+                                            self.current_session['subject'],
+                                            'AUTO'
+                                        )
+                                        
+                                        if success:
+                                            last_auto_capture[emp_id] = current_time
+                                            color = (0, 255, 0)
+                                            log_msg = f"[{datetime.now().strftime('%H:%M:%S')}] AUTO - {message} ({confidence:.1f}%)\n"
+                                            log_text.insert('1.0', log_msg)
+                                            log_text.see('1.0')
+                                        else:
+                                            color = (0, 165, 255)
+                                    else:
+                                        color = (0, 165, 255)
+                                else:
+                                    color = (255, 255, 0)  # Yellow for manual
+                        
+                        cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+                        cv2.rectangle(frame, (left, bottom-35), (right, bottom), color, cv2.FILLED)
+                        cv2.putText(frame, name, (left+6, bottom-6), 
+                                   cv2.FONT_HERSHEY_DUPLEX, 0.6, (255,255,255), 1)
+                
+                # Display info
+                mode_text = "AUTO MODE" if self.auto_mode_var.get() else "MANUAL MODE"
+                cv2.putText(frame, mode_text, (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame, f"Detected: {len(self.detected_faces)}", (10, 60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cv2.putText(frame, timestamp, (10, frame.shape[0] - 10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                
+                # Display frame
+                img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img_pil = Image.fromarray(img_rgb)
+                img_pil = img_pil.resize((900, 600))
+                img_tk = ImageTk.PhotoImage(img_pil)
+                self.camera_label.config(image=img_tk)
+                self.camera_label.image = img_tk
+                
+                if not self.system.camera_running:
+                    break
+            
+            cap.release()
+            self.update_statistics()
+        
+        def stop_scanner():
+            self.system.camera_running = False
+            
+            export = messagebox.askyesno("Export Attendance", 
+                                        "Export this session's attendance to Excel?")
+            if export:
+                filename = filedialog.asksaveasfilename(
+                    defaultextension=".xlsx",
+                    filetypes=[("Excel files", "*.xlsx")],
+                    initialfile=f"attendance_{self.current_session['class']}_{self.current_session['subject']}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+                )
+                if filename:
+                    success, msg = self.system.export_to_excel(
+                        datetime.now().date(),
+                        datetime.now().date(),
+                        filename,
+                        self.current_session['class'],
+                        self.current_session['subject']
+                    )
+                    if success:
+                        messagebox.showinfo("Success", msg)
+                    else:
+                        messagebox.showerror("Error", msg)
+            
+            scanner_window.destroy()
+        
+        scanner_window.protocol("WM_DELETE_WINDOW", stop_scanner)
+        
+        tk.Button(scanner_window, text="⏹ Stop Scanner & Export", command=stop_scanner,
+                 bg='#e74c3c', fg='white', font=('Arial', 12, 'bold'),
+                 width=25, height=2).pack(pady=10)
+        
+        self.camera_thread = threading.Thread(target=scanner_loop, daemon=True)
+        self.camera_thread.start()
+    
+    def view_reports(self):
+        """View attendance reports"""
+        report_window = tk.Toplevel(self.root)
+        report_window.title("Attendance Reports")
+        report_window.geometry("1100x600")
+        report_window.configure(bg='white')
+        
+        tk.Label(report_window, text="📊 ATTENDANCE REPORTS", 
+                font=('Arial', 18, 'bold'), bg='white').pack(pady=15)
+        
+        filter_frame = tk.Frame(report_window, bg='white')
+        filter_frame.pack(pady=10)
+        
+        tk.Label(filter_frame, text="From:", font=('Arial', 11), bg='white').grid(row=0, column=0, padx=5)
+        from_date = tk.Entry(filter_frame, font=('Arial', 11), width=12)
+        from_date.insert(0, datetime.now().strftime('%Y-%m-%d'))
+        from_date.grid(row=0, column=1, padx=5)
+        
+        tk.Label(filter_frame, text="To:", font=('Arial', 11), bg='white').grid(row=0, column=2, padx=5)
+        to_date = tk.Entry(filter_frame, font=('Arial', 11), width=12)
+        to_date.insert(0, datetime.now().strftime('%Y-%m-%d'))
+        to_date.grid(row=0, column=3, padx=5)
+        
+        table_frame = tk.Frame(report_window)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        columns = ('ID', 'Name', 'Date', 'In', 'Out', 'Hours', 'Class', 'Subject', 'Status')
+        tree = ttk.Treeview(table_frame, columns=columns, show='headings', height=15)
+        
+        for col in columns:
+            tree.heading(col, text=col)
+            tree.column(col, width=110, anchor='center')
+        
+        scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscroll=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(fill=tk.BOTH, expand=True)
+        
+        def load_report():
+            for item in tree.get_children():
+                tree.delete(item)
+            
+            try:
+                conn = sqlite3.connect(self.system.db_path)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT e.employee_id, e.name, a.date, a.check_in_time, 
+                           a.check_out_time, a.total_hours, a.class_name, 
+                           a.subject, a.status
+                    FROM attendance_summary a
+                    JOIN employees e ON a.employee_id = e.employee_id
+                    WHERE a.date BETWEEN ? AND ?
+                    ORDER BY a.date DESC, e.name
+                ''', (from_date.get(), to_date.get()))
+                
+                records = cursor.fetchall()
+                conn.close()
+                
+                for record in records:
+                    formatted = list(record)
+                    formatted[3] = str(formatted[3])[:8] if formatted[3] else '--:--'
+                    formatted[4] = str(formatted[4])[:8] if formatted[4] else '--:--'
+                    formatted[5] = f"{formatted[5]:.2f}" if formatted[5] else '0.00'
+                    tree.insert('', tk.END, values=formatted)
+                
+                messagebox.showinfo("Success", f"Loaded {len(records)} records")
+                
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+        
+        tk.Button(report_window, text="🔄 Load Report", command=load_report,
+                 bg='#3498db', fg='white', font=('Arial', 11, 'bold'),
+                 width=15, height=2).pack(pady=10)
+    
+    def export_menu(self):
+        """Export to Excel"""
+        export_window = tk.Toplevel(self.root)
+        export_window.title("Export to Excel")
+        export_window.geometry("500x400")
+        export_window.configure(bg='white')
+        
+        tk.Label(export_window, text="📤 EXPORT TO EXCEL", 
+                font=('Arial', 16, 'bold'), bg='white').pack(pady=20)
+        
+        date_frame = tk.Frame(export_window, bg='white')
+        date_frame.pack(pady=20)
+        
+        tk.Label(date_frame, text="From:", font=('Arial', 11), bg='white').grid(row=0, column=0, padx=5, pady=5)
+        from_date = tk.Entry(date_frame, font=('Arial', 11), width=15)
+        from_date.insert(0, (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d'))
+        from_date.grid(row=0, column=1, padx=5, pady=5)
+        
+        tk.Label(date_frame, text="To:", font=('Arial', 11), bg='white').grid(row=1, column=0, padx=5, pady=5)
+        to_date = tk.Entry(date_frame, font=('Arial', 11), width=15)
+        to_date.insert(0, datetime.now().strftime('%Y-%m-%d'))
+        to_date.grid(row=1, column=1, padx=5, pady=5)
+        
+        tk.Label(date_frame, text="Class (optional):", font=('Arial', 11), bg='white').grid(row=2, column=0, padx=5, pady=5)
+        class_entry = tk.Entry(date_frame, font=('Arial', 11), width=15)
+        class_entry.grid(row=2, column=1, padx=5, pady=5)
+        
+        tk.Label(date_frame, text="Subject (optional):", font=('Arial', 11), bg='white').grid(row=3, column=0, padx=5, pady=5)
+        subject_entry = tk.Entry(date_frame, font=('Arial', 11), width=15)
+        subject_entry.grid(row=3, column=1, padx=5, pady=5)
+        
+        def do_export():
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                filetypes=[("Excel files", "*.xlsx")],
+                initialfile=f"attendance_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            )
+            if filename:
+                class_name = class_entry.get().strip() or None
+                subject = subject_entry.get().strip() or None
+                
+                success, message = self.system.export_to_excel(
+                    from_date.get(), to_date.get(), filename, class_name, subject
+                )
+                if success:
+                    messagebox.showinfo("Success", message)
+                else:
+                    messagebox.showerror("Error", message)
+        
+        tk.Button(export_window, text="📊 Export to Excel", command=do_export,
+                 bg='#27ae60', fg='white', font=('Arial', 12, 'bold'),
+                 width=20, height=3).pack(pady=30)
+    
+    def employee_list(self):
+        """View employee list"""
+        emp_window = tk.Toplevel(self.root)
+        emp_window.title("Employee List")
+        emp_window.geometry("900x500")
+        emp_window.configure(bg='white')
+        
+        tk.Label(emp_window, text="👥 EMPLOYEE LIST", 
+                font=('Arial', 16, 'bold'), bg='white').pack(pady=15)
+        
+        table_frame = tk.Frame(emp_window)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        columns = ('ID', 'Employee ID', 'Name', 'Department', 'Email', 'Status')
+        tree = ttk.Treeview(table_frame, columns=columns, show='headings', height=15)
+        
+        for col in columns:
+            tree.heading(col, text=col)
+            tree.column(col, width=140, anchor='center')
+        
+        scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscroll=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(fill=tk.BOTH, expand=True)
+        
+        try:
+            conn = sqlite3.connect(self.system.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, employee_id, name, department, email, status
+                FROM employees
+                ORDER BY employee_id
+            ''')
+            
+            employees = cursor.fetchall()
+            conn.close()
+            
+            for emp in employees:
+                tree.insert('', tk.END, values=emp)
+            
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+        
+        def view_photo():
+            selection = tree.selection()
+            if not selection:
+                messagebox.showwarning("Warning", "Please select an employee")
+                return
+            
+            emp_id = tree.item(selection[0])['values'][1]
+            
+            conn = sqlite3.connect(self.system.db_path)
+            cursor = conn.cursor()
+            cursor.execute('SELECT name, registration_photo FROM employees WHERE employee_id=?', (emp_id,))
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                name, photo_blob = result
+                img = self.system.blob_to_image(photo_blob)
+                cv2.imshow(f"Photo - {name}", img)
+                cv2.waitKey(0)
+                cv2.destroyAllWindows()
+        
+        tk.Button(emp_window, text="📷 View Photo", command=view_photo,
+                 bg='#3498db', fg='white', font=('Arial', 11, 'bold'),
+                 width=15, height=2).pack(pady=10)
+    
+    def run(self):
+        """Run the dashboard"""
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    print("="*70)
+    print("  BIOMETRIC ATTENDANCE SYSTEM - FIXED VERSION")
+    print("  Enhanced Camera Handling & Error Detection")
+    print("="*70)
+    print("\n🔧 CAMERA FIXES APPLIED:")
+    print("  ✓ Multiple camera backend support (DirectShow, Media Foundation)")
+    print("  ✓ Enhanced camera detection")
+    print("  ✓ Proper camera initialization with error handling")
+    print("  ✓ Camera test feature added")
+    print("  ✓ Better frame reading with fallbacks")
+    print("\n💡 IMPORTANT:")
+    print("  1. Click 'Test Camera' FIRST before using scanner")
+    print("  2. Close other apps using camera (Zoom, Teams, Skype)")
+    print("  3. If camera fails, try different camera index in settings")
+    print("\n🎓 FEATURES:")
+    print("  • Employee Registration with Photo Capture")
+    print("  • Class/Subject/Teacher Tracking")
+    print("  • Auto & Manual Capture Modes")
+    print("  • Export to Excel with Class Details")
+    print("  • Real-time Face Recognition")
+    print("="*70)
+    print("\nInitializing system...\n")
+    
+    try:
+        system = BiometricAttendanceSystem()
+        dashboard = AdminDashboard(system)
+        
+        print("✅ System initialized successfully!")
+        print("✅ Dashboard opened\n")
+        print("🎯 NEXT STEPS:")
+        print("  1. Click 'Test Camera' to verify camera works")
+        print("  2. Register employees")
+        print("  3. Start scanner with class details")
+        print("="*70)
+        
+        dashboard.run()
+        
+    except Exception as e:
+        print(f"\n❌ ERROR: {e}")
+        print("\nTroubleshooting:")
+        print("  • Make sure OpenCV is installed: pip install opencv-python")
+        print("  • Make sure face_recognition is installed")
+        print("  • Check camera permissions")
+        print("  • Close other apps using camera")
+        input("\nPress Enter to exit...")
